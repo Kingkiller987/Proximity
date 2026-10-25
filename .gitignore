@@ -55,3 +55,6 @@ app.*.map.json
 # Graphify generated artifacts and caches
 graphify-out/
 
+# Local agent rules and workflow customizations
+.agents/
+
