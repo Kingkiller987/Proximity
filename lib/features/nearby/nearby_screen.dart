@@ -1,13 +1,22 @@
 import 'package:flutter/material.dart';
 
+import '../../core/config/app_config.dart';
+import '../../core/media/native_image_picker_helper.dart';
 import '../../core/models/models.dart';
 import '../../core/state/app_controller.dart';
 import '../../core/theme/app_theme.dart';
+import '../chat/chat_image_widgets.dart';
+import '../profile/report_user_dialog.dart';
+import '../profile/user_profile_sheet.dart';
+import 'nearby_members_sidebar.dart';
+
+enum _NearbyViewTab { nearbyChats, events }
 
 class NearbyScreen extends StatefulWidget {
-  const NearbyScreen({super.key, required this.controller});
+  const NearbyScreen({super.key, required this.controller, this.config});
 
   final AppController controller;
+  final AppConfig? config;
 
   @override
   State<NearbyScreen> createState() => _NearbyScreenState();
@@ -15,406 +24,533 @@ class NearbyScreen extends StatefulWidget {
 
 class _NearbyScreenState extends State<NearbyScreen> {
   final TextEditingController _composerController = TextEditingController();
+  final NativeImagePickerHelper _imagePicker = NativeImagePickerHelper();
+  _NearbyViewTab _activeView = _NearbyViewTab.nearbyChats;
+  String? _selectedEventId;
 
   @override
   void dispose() {
+    widget.controller.setCurrentlyActiveChannelId(null);
     _composerController.dispose();
     super.dispose();
   }
 
-  void _handleSend() {
-    final text = _composerController.text.trim();
-    if (text.isEmpty) return;
-    widget.controller.sendNearbyMessage(text);
-    _composerController.clear();
+  String? get _activeChannelId {
+    final active = widget.controller.activeLandmarkChats;
+    if (active.isEmpty) return null;
+    return active.any((c) => c.id == widget.controller.selectedLandmarkId)
+        ? widget.controller.selectedLandmarkId
+        : active.first.id;
   }
 
-  void _showParticipantActions(
-    BuildContext context, {
-    required String userId,
-    required String displayName,
-  }) {
-    if (userId == widget.controller.profile.id) return;
-    final dmInput = TextEditingController();
+  Future<void> _handleAttachPhoto() async {
+    final channelId = _activeView == _NearbyViewTab.nearbyChats
+        ? _activeChannelId
+        : _selectedEventId;
+    if (channelId == null) return;
 
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: AppTheme.darkSurface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+    final result = await _imagePicker.promptAndPickSanitizedImage(
+      context,
+      maxBytes: widget.controller.maxImageBytes,
+    );
+    if (result == null) return;
+    if (result.errorMessage != null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(result.errorMessage!),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+      return;
+    }
+    if (result.isValid && result.sanitizedBytes != null && mounted) {
+      widget.controller.stageImageUpload(
+        channelId: channelId,
+        rawBytes: result.sanitizedBytes!,
+      );
+    }
+  }
+
+  void _handleSend() {
+    final text = _composerController.text.trim();
+    if (_activeView == _NearbyViewTab.nearbyChats) {
+      final channelId = _activeChannelId;
+      if (channelId == null) return;
+      final pending = widget.controller.pendingUploadsForChannel(channelId);
+      final stagedId = pending.isNotEmpty ? pending.first.uploadId : null;
+      if (text.isEmpty && stagedId == null) return;
+
+      if (widget.controller.sendLandmarkMessage(
+        channelId,
+        text,
+        stagedUploadId: stagedId,
+      )) {
+        _composerController.clear();
+      }
+    } else {
+      final eventId = _selectedEventId;
+      if (eventId == null) return;
+      final pending = widget.controller.pendingUploadsForChannel(eventId);
+      final stagedId = pending.isNotEmpty ? pending.first.uploadId : null;
+      if (text.isEmpty && stagedId == null) return;
+
+      if (widget.controller.sendEventMessage(
+        eventId,
+        text,
+        stagedUploadId: stagedId,
+      )) {
+        _composerController.clear();
+      }
+    }
+  }
+
+  void _showParticipantSheet(String userId) {
+    if (userId == widget.controller.profile.id) return;
+    final projection = widget.controller.publicProjectionForUser(userId);
+    showUserProfileSheet(
+      context,
+      projection: projection,
+      distanceLabel: '~100m away',
+      onSendDm: () {
+        widget.controller.sendDmRequest(
+          toUserId: userId,
+          toDisplayName: projection.displayName,
+          introMessage: 'Hello!',
+        );
+      },
+      onBlock: () =>
+          widget.controller.blockUser(userId, label: projection.displayName),
+      onReport: () => ReportUserDialog.show(
+        context,
+        controller: widget.controller,
+        targetId: userId,
+        targetLabel: projection.displayName,
       ),
-      builder: (ctx) {
-        return Padding(
-          padding: EdgeInsets.only(
-            left: 20,
-            right: 20,
-            top: 20,
-            bottom: MediaQuery.of(ctx).viewInsets.bottom + 24,
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              Row(
-                children: <Widget>[
-                  CircleAvatar(
-                    backgroundColor: AppTheme.pulseMint.withValues(alpha: 0.2),
-                    child: Text(
-                      displayName.replaceFirst('@', '').substring(0, 1),
-                      style: const TextStyle(
-                        color: AppTheme.pulseMint,
-                        fontWeight: FontWeight.bold,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: widget.controller,
+      builder: (context, _) {
+        final c = widget.controller;
+        final profile = c.profile;
+
+        if (!c.hasLocationAccess) {
+          return _LocationPermissionGate(controller: c);
+        }
+
+        final participants = c.visibleNearbyParticipants;
+        final activeLandmarks = c.activeLandmarkChats;
+
+        if (c.requestedNearbyTargetId != null) {
+          if (c.requestedNearbyIsEvent) {
+            _activeView = _NearbyViewTab.events;
+            _selectedEventId = c.requestedNearbyTargetId;
+          } else {
+            _activeView = _NearbyViewTab.nearbyChats;
+          }
+        }
+
+        final activeChannelId = _activeChannelId;
+        final selectedLandmark = activeLandmarks
+            .where((l) => l.id == activeChannelId)
+            .firstOrNull;
+        final joinedEvents = c.joinedEvents;
+        if (_selectedEventId == null && joinedEvents.isNotEmpty) {
+          _selectedEventId = joinedEvents.first.id;
+        } else if (joinedEvents.isNotEmpty &&
+            !joinedEvents.any((e) => e.id == _selectedEventId)) {
+          _selectedEventId = joinedEvents.first.id;
+        }
+
+        final messages = _activeView == _NearbyViewTab.nearbyChats
+            ? (activeChannelId != null
+                  ? c.landmarkMessagesFor(activeChannelId)
+                  : const <ChatMessage>[])
+            : (_selectedEventId != null
+                  ? c.eventMessagesFor(_selectedEventId!)
+                  : const <ChatMessage>[]);
+
+        final activeUploadChannelId = _activeView == _NearbyViewTab.nearbyChats
+            ? activeChannelId
+            : _selectedEventId;
+        final pendingUploads = activeUploadChannelId != null
+            ? c.pendingUploadsForChannel(activeUploadChannelId)
+            : const <PendingImageUpload>[];
+
+        return Scaffold(
+          endDrawer: NearbyMembersSidebar(controller: c),
+          appBar: AppBar(
+            title: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const Text('Nearby Pulse'),
+                Text(
+                  selectedLandmark != null
+                      ? selectedLandmark.headerDistanceLabel
+                      : '${c.currentLocation.areaName} • Outside landmark zones',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+            actions: <Widget>[
+              Builder(
+                builder: (ctx) => IconButton(
+                  key: const Key('nearby-members-sidebar-btn'),
+                  tooltip: 'Nearby Members',
+                  icon: const Icon(Icons.people_outline),
+                  onPressed: () => Scaffold.of(ctx).openEndDrawer(),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(right: 12),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(20),
+                  onTap: c.toggleGhostMode,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: profile.isGhostMode
+                          ? AppTheme.ghostViolet.withAlpha(45)
+                          : AppTheme.pulseMint.withAlpha(45),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                        color: profile.isGhostMode
+                            ? AppTheme.ghostViolet
+                            : AppTheme.pulseMint,
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
                       children: <Widget>[
-                        Text(
-                          displayName,
-                          style: const TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.w700,
-                          ),
+                        Icon(
+                          profile.isGhostMode
+                              ? Icons.visibility_off_outlined
+                              : Icons.radar,
+                          size: 15,
+                          color: profile.isGhostMode
+                              ? AppTheme.ghostViolet
+                              : AppTheme.pulseMint,
                         ),
-                        const Text(
-                          'Exact coordinates hidden • DM requires approval',
+                        const SizedBox(width: 6),
+                        Text(
+                          'Ghost Mode',
                           style: TextStyle(
                             fontSize: 12,
-                            color: Color(0xFF94A3B8),
+                            fontWeight: FontWeight.w700,
+                            color: profile.isGhostMode
+                                ? const Color(0xFFC4B5FD)
+                                : AppTheme.pulseMint,
                           ),
                         ),
                       ],
                     ),
                   ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: dmInput,
-                decoration: const InputDecoration(
-                  labelText: 'Request Direct Message',
-                  hintText: 'Say hello and why you want to connect...',
                 ),
               ),
-              const SizedBox(height: 12),
-              SizedBox(
-                width: double.infinity,
-                child: FilledButton.icon(
-                  onPressed: () {
-                    final err = widget.controller.sendDmRequest(
-                      toUserId: userId,
-                      toDisplayName: displayName,
-                      introMessage: dmInput.text,
-                    );
-                    Navigator.of(ctx).pop();
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(
-                        content: Text(
-                          err ?? 'Message request sent to $displayName.',
+            ],
+          ),
+          body: Column(
+            children: <Widget>[
+              // 2-Way Switch: Nearby Chats | Events You're In
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 6,
+                ),
+                color: Theme.of(context).colorScheme.surface,
+                child: Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: ChoiceChip(
+                        key: const Key('nearby-chats-tab'),
+                        label: const Center(
+                          child: Text(
+                            'Nearby Chats',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        selected: _activeView == _NearbyViewTab.nearbyChats,
+                        onSelected: (_) => setState(
+                          () => _activeView = _NearbyViewTab.nearbyChats,
                         ),
                       ),
-                    );
-                  },
-                  icon: const Icon(Icons.mark_chat_unread_outlined, size: 18),
-                  label: const Text('Send DM Request'),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: ChoiceChip(
+                        key: const Key('nearby-events-tab'),
+                        label: const Center(
+                          child: Text(
+                            "Events You're In",
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        selected: _activeView == _NearbyViewTab.events,
+                        onSelected: (_) =>
+                            setState(() => _activeView = _NearbyViewTab.events),
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              const Divider(height: 24),
-              Row(
-                children: <Widget>[
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: () {
-                        widget.controller.blockUser(userId, label: displayName);
-                        Navigator.of(ctx).pop();
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text('Blocked $displayName.')),
-                        );
-                      },
-                      icon: const Icon(Icons.block, size: 18),
-                      label: const Text('Block'),
+              if (!c.hasFreshAccurateLocation)
+                Container(
+                  margin: const EdgeInsets.all(16),
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color:
+                        Theme.of(context).cardTheme.color ??
+                        Theme.of(context).colorScheme.surface,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: AppTheme.expiryAmber),
+                  ),
+                  child: Row(
+                    children: <Widget>[
+                      const Icon(
+                        Icons.location_off_outlined,
+                        color: AppTheme.expiryAmber,
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          'Location fix expired or unavailable. Fresh location required to access proximity chat.',
+                          style: TextStyle(
+                            color: Theme.of(context)
+                                .colorScheme
+                                .onSurfaceVariant,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                )
+              else if (_activeView == _NearbyViewTab.nearbyChats) ...<Widget>[
+                // Proximity-chat dropdown
+                if (activeLandmarks.isNotEmpty)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 6,
+                    ),
+                    color: Theme.of(context).colorScheme.surface,
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<String>(
+                        key: const Key('nearby-proximity-chat-dropdown'),
+                        isExpanded: true,
+                        menuMaxHeight: (MediaQuery.sizeOf(context).height * 0.5)
+                            .clamp(160.0, 320.0),
+                        value:
+                            activeLandmarks.any((l) => l.id == activeChannelId)
+                            ? activeChannelId
+                            : activeLandmarks.first.id,
+                        items: activeLandmarks.map((lm) {
+                          return DropdownMenuItem<String>(
+                            value: lm.id,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              mainAxisSize: MainAxisSize.min,
+                              children: <Widget>[
+                                Text(
+                                  lm.name,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                Text(
+                                  lm.headerDistanceLabel,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: Theme.of(context)
+                                        .colorScheme
+                                        .onSurfaceVariant,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        }).toList(),
+                        onChanged: (id) {
+                          if (id != null) c.selectLandmark(id);
+                        },
+                      ),
+                    ),
+                  )
+                else
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    color: Theme.of(context).colorScheme.surfaceContainer,
+                    child: Center(
+                      child: Text(
+                        'Outside landmark zones. Move closer to enter a landmark proximity chat.',
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                          fontSize: 12,
+                        ),
+                      ),
                     ),
                   ),
-                  const SizedBox(width: 12),
+                _PrivacyBanner(
+                  visibleCount: participants.length,
+                  isGhost: profile.isGhostMode,
+                ),
+                Expanded(
+                  child: !c.canParticipateInNearby
+                      ? const _BrowseDisabledState()
+                      : messages.isEmpty
+                      ? const _EmptyNearbyChatState()
+                      : ListView.separated(
+                          key: const Key('nearby-message-list'),
+                          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+                          itemCount: messages.length,
+                          separatorBuilder: (_, _) =>
+                              const SizedBox(height: 10),
+                          itemBuilder: (context, index) {
+                            final msg = messages[index];
+                            final isMe = msg.senderId == profile.id;
+                            return _ChatBubble(
+                              controller: c,
+                              message: msg,
+                              isMe: isMe,
+                              distanceLabel: msg.distanceLabel,
+                              onTapSender: () =>
+                                  _showParticipantSheet(msg.senderId),
+                            );
+                          },
+                        ),
+                ),
+                StagedImagePreviewBar(
+                  pendingUploads: pendingUploads,
+                  onCancel: (id) => c.cancelStagedUpload(id),
+                ),
+                _MessageComposer(
+                  controller: _composerController,
+                  identityLabel: profile.activeDisplayName,
+                  enabled:
+                      c.canParticipateInNearby && activeLandmarks.isNotEmpty,
+                  onAttachPhoto: _handleAttachPhoto,
+                  onSend: _handleSend,
+                ),
+              ] else ...<Widget>[
+                // Events You're In View
+                if (joinedEvents.isEmpty)
                   Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: () {
-                        widget.controller.reportTarget(
-                          targetId: userId,
-                          targetLabel: displayName,
-                          reason: 'Reported from nearby chat',
-                        );
-                        Navigator.of(ctx).pop();
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
-                            content: Text('Reported $displayName for review.'),
+                    child: Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Text(
+                          "You haven't joined any active events in this radius yet.\nDiscover events in the Explore tab.",
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Theme.of(context)
+                                .colorScheme
+                                .onSurfaceVariant,
                           ),
-                        );
-                      },
-                      icon: const Icon(Icons.flag_outlined, size: 18),
-                      label: const Text('Report'),
+                        ),
+                      ),
                     ),
+                  )
+                else ...<Widget>[
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 6,
+                    ),
+                    color: Theme.of(context).colorScheme.surface,
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<String>(
+                        isExpanded: true,
+                        value: _selectedEventId,
+                        items: joinedEvents.map((evt) {
+                          return DropdownMenuItem<String>(
+                            value: evt.id,
+                            child: Text(
+                              '${evt.title} (${evt.participantCount} attendees)',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          );
+                        }).toList(),
+                        onChanged: (id) {
+                          if (id != null) {
+                            setState(() => _selectedEventId = id);
+                          }
+                        },
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: messages.isEmpty
+                        ? Center(
+                            child: Text(
+                              'No messages in this event chat yet.',
+                              style: TextStyle(
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onSurfaceVariant,
+                              ),
+                            ),
+                          )
+                        : ListView.separated(
+                            padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+                            itemCount: messages.length,
+                            separatorBuilder: (_, _) =>
+                                const SizedBox(height: 10),
+                            itemBuilder: (context, index) {
+                              final msg = messages[index];
+                              final isMe = msg.senderId == profile.id;
+                              return _ChatBubble(
+                                controller: c,
+                                message: msg,
+                                isMe: isMe,
+                                distanceLabel: msg.distanceLabel,
+                                onTapSender: () =>
+                                    _showParticipantSheet(msg.senderId),
+                              );
+                            },
+                          ),
+                  ),
+                  StagedImagePreviewBar(
+                    pendingUploads: pendingUploads,
+                    onCancel: (id) => c.cancelStagedUpload(id),
+                  ),
+                  _MessageComposer(
+                    controller: _composerController,
+                    identityLabel: profile.activeDisplayName,
+                    enabled: true,
+                    onAttachPhoto: _handleAttachPhoto,
+                    onSend: _handleSend,
                   ),
                 ],
-              ),
+              ],
             ],
           ),
         );
       },
     );
   }
-
-  @override
-  Widget build(BuildContext context) {
-    final c = widget.controller;
-    final profile = c.profile;
-
-    if (!c.hasLocationAccess) {
-      return _LocationPermissionGate(controller: c);
-    }
-
-    final participants = c.visibleNearbyParticipants;
-    final messages = c.nearbyMessages;
-
-    return Scaffold(
-      appBar: AppBar(
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            const Text('Nearby Pulse'),
-            Text(
-              '${c.currentLocation.areaName} • ${(profile.nearbyRadiusMeters).round()}m radius',
-              style: const TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w500,
-                color: Color(0xFF94A3B8),
-              ),
-            ),
-          ],
-        ),
-        actions: <Widget>[
-          Padding(
-            padding: const EdgeInsets.only(right: 12),
-            child: InkWell(
-              borderRadius: BorderRadius.circular(20),
-              onTap: () => c.setVisibleInNearby(!profile.visibleInNearby),
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 6,
-                ),
-                decoration: BoxDecoration(
-                  color: profile.visibleInNearby
-                      ? AppTheme.pulseMint.withValues(alpha: 0.18)
-                      : AppTheme.ghostViolet.withValues(alpha: 0.18),
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(
-                    color: profile.visibleInNearby
-                        ? AppTheme.pulseMint
-                        : AppTheme.ghostViolet,
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: <Widget>[
-                    Icon(
-                      profile.visibleInNearby
-                          ? Icons.radar
-                          : Icons.visibility_off_outlined,
-                      size: 15,
-                      color: profile.visibleInNearby
-                          ? AppTheme.pulseMint
-                          : AppTheme.ghostViolet,
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      profile.visibleInNearby ? 'Visible' : 'Ghost Mode',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w700,
-                        color: profile.visibleInNearby
-                            ? AppTheme.pulseMint
-                            : const Color(0xFFC4B5FD),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-      body: Column(
-        children: <Widget>[
-          _RadiusAndLocationBar(controller: c),
-          _EphemeralNoticeBanner(
-            retentionHours: profile.messageRetentionHours,
-            visibleCount: participants.length,
-            isGhost: !profile.visibleInNearby && profile.ghostBrowseNearby,
-          ),
-          if (participants.isNotEmpty)
-            SizedBox(
-              height: 46,
-              child: ListView.separated(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 6,
-                ),
-                scrollDirection: Axis.horizontal,
-                itemCount: participants.length,
-                separatorBuilder: (_, _) => const SizedBox(width: 8),
-                itemBuilder: (context, index) {
-                  final p = participants[index];
-                  final distLabel = c.currentLocation.privacyDistanceLabelTo(
-                    p.location,
-                  );
-                  return ActionChip(
-                    avatar: Icon(
-                      p.isAnonymous
-                          ? Icons.shield_outlined
-                          : Icons.alternate_email,
-                      size: 15,
-                      color: AppTheme.pulseMint,
-                    ),
-                    label: Text(
-                      '${p.displayName} • $distLabel',
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                    onPressed: () => _showParticipantActions(
-                      context,
-                      userId: p.userId,
-                      displayName: p.displayName,
-                    ),
-                  );
-                },
-              ),
-            ),
-          Expanded(
-            child: !profile.visibleInNearby && !profile.ghostBrowseNearby
-                ? const _BrowseDisabledState()
-                : messages.isEmpty
-                ? const _EmptyNearbyChatState()
-                : ListView.separated(
-                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-                    itemCount: messages.length,
-                    separatorBuilder: (_, _) => const SizedBox(height: 10),
-                    itemBuilder: (context, index) {
-                      final msg = messages[index];
-                      final isMe = msg.senderId == profile.id;
-                      final distLabel = c.currentLocation
-                          .privacyDistanceLabelTo(msg.originPoint);
-                      final expiryLabel = formatRemainingTime(
-                        msg.expiresAt,
-                        c.now,
-                      );
-                      return _ChatBubble(
-                        message: msg,
-                        isMe: isMe,
-                        distanceLabel: distLabel,
-                        expiryLabel: expiryLabel,
-                        onTapSender: () => _showParticipantActions(
-                          context,
-                          userId: msg.senderId,
-                          displayName: msg.senderDisplayName,
-                        ),
-                      );
-                    },
-                  ),
-          ),
-          _MessageComposer(
-            controller: _composerController,
-            identityLabel: profile.activeDisplayName,
-            retentionHours: profile.messageRetentionHours,
-            onSend: _handleSend,
-          ),
-        ],
-      ),
-    );
-  }
 }
 
-class _RadiusAndLocationBar extends StatelessWidget {
-  const _RadiusAndLocationBar({required this.controller});
+class _PrivacyBanner extends StatelessWidget {
+  const _PrivacyBanner({required this.visibleCount, required this.isGhost});
 
-  final AppController controller;
-
-  static const List<double> _radii = <double>[250, 500, 1000, 2500];
-
-  @override
-  Widget build(BuildContext context) {
-    final currentRadius = controller.profile.nearbyRadiusMeters;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      decoration: const BoxDecoration(
-        color: AppTheme.darkSurface,
-        border: Border(bottom: BorderSide(color: Color(0xFF283558))),
-      ),
-      child: Row(
-        children: <Widget>[
-          Expanded(
-            child: DropdownButtonHideUnderline(
-              child: DropdownButton<GeoPoint>(
-                isExpanded: true,
-                isDense: true,
-                value: controller.currentLocation,
-                icon: const Icon(
-                  Icons.my_location_outlined,
-                  size: 16,
-                  color: AppTheme.pulseMint,
-                ),
-                items: AppController.presetLocations.map((loc) {
-                  return DropdownMenuItem<GeoPoint>(
-                    value: loc,
-                    child: Text(
-                      loc.areaName,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  );
-                }).toList(),
-                onChanged: (loc) {
-                  if (loc != null) controller.setSimulatedLocation(loc);
-                },
-              ),
-            ),
-          ),
-          const SizedBox(width: 8),
-          Wrap(
-            spacing: 4,
-            children: _radii.map((r) {
-              final selected = (currentRadius - r).abs() < 1;
-              final label = r >= 1000
-                  ? '${(r / 1000).toStringAsFixed(r == 1000 ? 0 : 1)}km'
-                  : '${r.round()}m';
-              return ChoiceChip(
-                label: Text(label, style: const TextStyle(fontSize: 11)),
-                selected: selected,
-                visualDensity: VisualDensity.compact,
-                onSelected: (_) => controller.setNearbyRadiusMeters(r),
-              );
-            }).toList(),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _EphemeralNoticeBanner extends StatelessWidget {
-  const _EphemeralNoticeBanner({
-    required this.retentionHours,
-    required this.visibleCount,
-    required this.isGhost,
-  });
-
-  final int retentionHours;
   final int visibleCount;
   final bool isGhost;
 
@@ -423,21 +559,24 @@ class _EphemeralNoticeBanner extends StatelessWidget {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      color: const Color(0xFF162038),
+      color: Theme.of(context).colorScheme.surfaceContainer,
       child: Row(
         children: <Widget>[
-          const Icon(
-            Icons.timer_outlined,
+          Icon(
+            isGhost ? Icons.visibility_off_outlined : Icons.people_outline,
             size: 15,
-            color: AppTheme.expiryAmber,
+            color: isGhost ? AppTheme.ghostViolet : AppTheme.pulseMint,
           ),
           const SizedBox(width: 6),
           Expanded(
             child: Text(
               isGhost
-                  ? 'Auto-expires in ${retentionHours}h • Browsing privately (hidden from $visibleCount visible nearby)'
-                  : 'Auto-expires in ${retentionHours}h • $visibleCount visible participant(s) in radius',
-              style: const TextStyle(fontSize: 12, color: Color(0xFFCBD5E1)),
+                  ? 'Browsing privately (hidden from $visibleCount visible nearby)'
+                  : '$visibleCount visible participant(s) in radius',
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
           ),
         ],
@@ -448,21 +587,25 @@ class _EphemeralNoticeBanner extends StatelessWidget {
 
 class _ChatBubble extends StatelessWidget {
   const _ChatBubble({
+    required this.controller,
     required this.message,
     required this.isMe,
     required this.distanceLabel,
-    required this.expiryLabel,
     required this.onTapSender,
   });
 
+  final AppController controller;
   final ChatMessage message;
   final bool isMe;
   final String distanceLabel;
-  final String expiryLabel;
   final VoidCallback onTapSender;
 
   @override
   Widget build(BuildContext context) {
+    final sentTime = formatMessageTimestamp(message.createdAt, controller.now);
+    final theme = Theme.of(context);
+    final isLight = theme.brightness == Brightness.light;
+
     return Align(
       alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
       child: ConstrainedBox(
@@ -474,13 +617,13 @@ class _ChatBubble extends StatelessWidget {
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
               color: isMe
-                  ? AppTheme.radarTeal.withValues(alpha: 0.26)
-                  : AppTheme.darkCard,
+                  ? AppTheme.radarTeal.withAlpha(isLight ? 45 : 66)
+                  : (theme.cardTheme.color ?? theme.colorScheme.surface),
               borderRadius: BorderRadius.circular(16),
               border: Border.all(
                 color: isMe
-                    ? AppTheme.pulseMint.withValues(alpha: 0.5)
-                    : const Color(0xFF283558),
+                    ? AppTheme.pulseMint.withAlpha(128)
+                    : theme.colorScheme.outlineVariant,
               ),
             ),
             child: Column(
@@ -489,16 +632,49 @@ class _ChatBubble extends StatelessWidget {
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: <Widget>[
-                    Icon(
-                      message.isAnonymous
-                          ? Icons.shield_outlined
-                          : Icons.verified_user_outlined,
-                      size: 13,
-                      color: message.isAnonymous
-                          ? const Color(0xFF94A3B8)
-                          : AppTheme.pulseMint,
+                    Builder(
+                      builder: (context) {
+                        final projection = controller.publicProjectionForUser(
+                          message.senderId,
+                        );
+                        final hasAvatar =
+                            !message.isAnonymous &&
+                            projection.avatarBytes != null &&
+                            projection.avatarBytes!.isNotEmpty;
+
+                        if (hasAvatar) {
+                          return Padding(
+                            padding: const EdgeInsets.only(right: 6),
+                            child: ClipOval(
+                              child: Image.memory(
+                                projection.avatarBytes!,
+                                width: 16,
+                                height: 16,
+                                fit: BoxFit.cover,
+                                errorBuilder: (_, _, _) => const Icon(
+                                  Icons.person_outline,
+                                  size: 13,
+                                  color: AppTheme.pulseMint,
+                                ),
+                              ),
+                            ),
+                          );
+                        }
+
+                        return Padding(
+                          padding: const EdgeInsets.only(right: 4),
+                          child: Icon(
+                            message.isAnonymous
+                                ? Icons.person
+                                : Icons.person_outline,
+                            size: 13,
+                            color: message.isAnonymous
+                                ? theme.colorScheme.onSurfaceVariant
+                                : AppTheme.pulseMint,
+                          ),
+                        );
+                      },
                     ),
-                    const SizedBox(width: 4),
                     Flexible(
                       child: Text(
                         isMe
@@ -508,57 +684,58 @@ class _ChatBubble extends StatelessWidget {
                           fontSize: 12,
                           fontWeight: FontWeight.w700,
                           color: isMe
-                              ? AppTheme.pulseMint
-                              : const Color(0xFFE2E8F0),
+                              ? (isLight
+                                    ? AppTheme.radarTeal
+                                    : AppTheme.pulseMint)
+                              : theme.colorScheme.onSurface,
                         ),
                       ),
                     ),
                     const SizedBox(width: 8),
                     Text(
                       distanceLabel,
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 11,
-                        color: Color(0xFF94A3B8),
+                        color: theme.colorScheme.onSurfaceVariant,
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 6),
-                Text(
-                  message.body,
-                  style: const TextStyle(
-                    fontSize: 14,
-                    height: 1.35,
-                    color: Color(0xFFF8FAFC),
+                if (message.body.isNotEmpty) ...<Widget>[
+                  const SizedBox(height: 6),
+                  Text(
+                    message.body,
+                    style: TextStyle(
+                      fontSize: 14,
+                      height: 1.35,
+                      color: isLight
+                          ? const Color(0xFF0F172A)
+                          : const Color(0xFFF8FAFC),
+                    ),
                   ),
-                ),
-                const SizedBox(height: 8),
+                ],
+                if (message.attachment != null)
+                  ChatImageBubble(
+                    controller: controller,
+                    attachment: message.attachment!,
+                  ),
+                const SizedBox(height: 6),
                 Wrap(
                   spacing: 8,
-                  runSpacing: 4,
+                  runSpacing: 2,
                   crossAxisAlignment: WrapCrossAlignment.center,
                   children: <Widget>[
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 7,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: AppTheme.expiryAmber.withValues(alpha: 0.15),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Text(
-                        '⏳ $expiryLabel',
-                        style: const TextStyle(
-                          fontSize: 10,
-                          fontWeight: FontWeight.w600,
-                          color: AppTheme.expiryAmber,
-                        ),
+                    Text(
+                      sentTime,
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w500,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
                       ),
                     ),
                     if (!isMe)
                       const Text(
-                        'Tap to request DM / safety',
+                        'Tap for user sheet',
                         style: TextStyle(
                           fontSize: 10,
                           color: Color(0xFF64748B),
@@ -579,13 +756,15 @@ class _MessageComposer extends StatelessWidget {
   const _MessageComposer({
     required this.controller,
     required this.identityLabel,
-    required this.retentionHours,
+    required this.enabled,
+    required this.onAttachPhoto,
     required this.onSend,
   });
 
   final TextEditingController controller;
   final String identityLabel;
-  final int retentionHours;
+  final bool enabled;
+  final VoidCallback onAttachPhoto;
   final VoidCallback onSend;
 
   @override
@@ -594,26 +773,38 @@ class _MessageComposer extends StatelessWidget {
       top: false,
       child: Container(
         padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
-        decoration: const BoxDecoration(
-          color: AppTheme.darkSurface,
-          border: Border(top: BorderSide(color: Color(0xFF283558))),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surface,
+          border: Border(
+            top: BorderSide(
+              color: Theme.of(context).colorScheme.outlineVariant,
+            ),
+          ),
         ),
         child: Row(
           children: <Widget>[
+            IconButton(
+              key: const Key('nearby-attach-photo-btn'),
+              tooltip: 'Attach EXIF-stripped photo',
+              onPressed: enabled ? onAttachPhoto : null,
+              icon: const Icon(Icons.add_photo_alternate_outlined, size: 20),
+            ),
             Expanded(
               child: TextField(
                 controller: controller,
-                onSubmitted: (_) => onSend(),
+                enabled: enabled,
+                onSubmitted: enabled ? (_) => onSend() : null,
                 decoration: InputDecoration(
-                  hintText:
-                      'Post as $identityLabel (${retentionHours}h expiry)...',
+                  hintText: enabled
+                      ? 'Post as $identityLabel...'
+                      : 'Enter a landmark radius to post...',
                   isDense: true,
                 ),
               ),
             ),
             const SizedBox(width: 8),
             IconButton.filled(
-              onPressed: onSend,
+              onPressed: enabled ? onSend : null,
               icon: const Icon(Icons.send_rounded, size: 18),
             ),
           ],
@@ -660,10 +851,13 @@ class _LocationPermissionGate extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 10),
-                  const Text(
+                  Text(
                     'Proximity uses your coarse area to show nearby chats and local temporary events. Your exact coordinates are never shown to other users, and you can browse in Ghost Mode.',
                     textAlign: TextAlign.center,
-                    style: TextStyle(color: Color(0xFF94A3B8), height: 1.4),
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      height: 1.4,
+                    ),
                   ),
                   const SizedBox(height: 20),
                   SizedBox(
@@ -702,23 +896,26 @@ class _EmptyNearbyChatState extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const Center(
-      child: Padding(
-        padding: EdgeInsets.all(28),
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            Icon(Icons.radar, size: 44, color: AppTheme.pulseMint),
-            SizedBox(height: 12),
-            Text(
-              'Quiet in this radius right now',
-              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+            const Icon(Icons.radar, size: 40, color: AppTheme.pulseMint),
+            const SizedBox(height: 10),
+            const Text(
+              'Quiet in this landmark right now',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
             ),
-            SizedBox(height: 6),
+            const SizedBox(height: 6),
             Text(
-              'Expand your discovery radius above or start a temporary conversation for people nearby.',
+              'Select another landmark or start a conversation for people nearby.',
               textAlign: TextAlign.center,
-              style: TextStyle(color: Color(0xFF94A3B8)),
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                fontSize: 13,
+              ),
             ),
           ],
         ),
@@ -732,23 +929,30 @@ class _BrowseDisabledState extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const Center(
-      child: Padding(
-        padding: EdgeInsets.all(28),
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            Icon(Icons.visibility_off, size: 44, color: AppTheme.ghostViolet),
-            SizedBox(height: 12),
-            Text(
-              'Nearby Feed Paused',
-              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+            const Icon(
+              Icons.visibility_off,
+              size: 40,
+              color: AppTheme.ghostViolet,
             ),
-            SizedBox(height: 6),
+            const SizedBox(height: 10),
+            const Text(
+              'Nearby Feed Paused',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 6),
             Text(
               'Both Nearby Visibility and Ghost Browsing are turned off in your Profile settings.',
               textAlign: TextAlign.center,
-              style: TextStyle(color: Color(0xFF94A3B8)),
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                fontSize: 13,
+              ),
             ),
           ],
         ),
