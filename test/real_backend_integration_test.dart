@@ -1,14 +1,15 @@
 @Tags(['live-backend'])
 library;
 
-import 'dart:io';
-
 import 'package:flutter_test/flutter_test.dart';
 import 'package:proximity_app/core/network/api_client.dart';
 import 'package:proximity_app/core/network/api_models.dart';
 
 void main() {
-  const backendBaseUrl = 'http://localhost:8000';
+  const backendBaseUrl = String.fromEnvironment(
+    'BACKEND_BASE_URL',
+    defaultValue: String.fromEnvironment('API_BASE_URL', defaultValue: 'http://localhost:8000'),
+  );
 
   group('Real Backend E2E Integration (FastAPI + PostGIS)', () {
     late ApiClient client;
@@ -17,8 +18,6 @@ void main() {
     setUpAll(() async {
       client = ApiClient(baseUrl: backendBaseUrl);
       try {
-        final socket = await Socket.connect('localhost', 8000, timeout: const Duration(seconds: 2));
-        await socket.close();
         final health = await client.healthCheck();
         isBackendAvailable = health['status'] == 'ok';
       } catch (_) {
@@ -252,6 +251,7 @@ void main() {
         password: 'Password123!',
       );
       final aliceProfile = await clientA.getMe();
+      expect(aliceProfile.username, aliceName);
 
       // Register Bob
       await clientB.register(

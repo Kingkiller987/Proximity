@@ -54,6 +54,7 @@ void main() {
         password: testPassword,
       );
       final profileA = await clientA.getMe();
+      expect(profileA.username, alphaUsername);
 
       await clientB.register(
         username: betaUsername,
@@ -61,6 +62,7 @@ void main() {
         password: testPassword,
       );
       final profileB = await clientB.getMe();
+      expect(profileB.username, betaUsername);
 
       // Alpha initiates DM request to Beta
       final dmReq = await clientA.createDmRequest(

@@ -6,7 +6,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:proximity_app/core/network/api_client.dart';
-import 'package:proximity_app/core/network/api_models.dart';
 import 'package:proximity_app/core/models/models.dart';
 import 'package:proximity_app/core/state/app_controller.dart';
 import 'package:proximity_app/features/chat/chat_image_widgets.dart';
