@@ -1617,6 +1617,24 @@ class AppController extends ChangeNotifier {
     return idx;
   }
 
+  void selectTab(int index) {
+    _requestedTabIndex = index;
+    notifyListeners();
+  }
+
+  void navigateToInbox() {
+    _requestedTabIndex = 3;
+    notifyListeners();
+  }
+
+  String? _pendingOpenDmThreadId;
+  String? get pendingOpenDmThreadId => _pendingOpenDmThreadId;
+  String? consumePendingOpenDmThreadId() {
+    final val = _pendingOpenDmThreadId;
+    _pendingOpenDmThreadId = null;
+    return val;
+  }
+
   bool _requestedNearbyIsEvent = false;
   bool get requestedNearbyIsEvent => _requestedNearbyIsEvent;
 
@@ -1900,10 +1918,59 @@ class AppController extends ChangeNotifier {
           }
         }
       }
+
+      await syncDmInboxFromBackend();
     } catch (_) {
       // Gracefully handle background sync errors
     }
   }
+
+  /// Synchronizes direct message conversations from the backend.
+  Future<void> syncDmInboxFromBackend() async {
+    final client = apiClient;
+    if (client == null || !client.isAuthenticated) return;
+    try {
+      final inbox = await client.getDmInbox();
+      for (final conv in inbox) {
+        final existingIdx = _dmRequests.indexWhere((r) => r.id == conv.id);
+        final status = conv.status == 'accepted'
+            ? DmRequestStatus.accepted
+            : (conv.status == 'declined'
+                ? DmRequestStatus.declined
+                : DmRequestStatus.pending);
+
+        final peerName = conv.otherUser.displayName;
+        final peerId = conv.otherUser.userId;
+        final fromId = conv.isIncoming ? peerId : _profile.id;
+        final toId = conv.isIncoming ? _profile.id : peerId;
+        final fromName =
+            conv.isIncoming ? peerName : _profile.publicDisplayName;
+        final toName = conv.isIncoming ? _profile.publicDisplayName : peerName;
+
+        if (existingIdx != -1) {
+          _dmRequests[existingIdx] = _dmRequests[existingIdx].copyWith(
+            status: status,
+          );
+        } else {
+          _dmRequests.add(
+            DmRequest(
+              id: conv.id,
+              fromUserId: fromId,
+              fromDisplayName: fromName,
+              fromIsAnonymous: false,
+              toUserId: toId,
+              toDisplayName: toName,
+              introMessage: conv.introMessage,
+              createdAt: conv.createdAt,
+              status: status,
+            ),
+          );
+        }
+      }
+      notifyListeners();
+    } catch (_) {}
+  }
+
 
   /// Demonstration login. Checks mock registry case-insensitively.
   /// Passwords are never checked or stored.
@@ -3079,6 +3146,10 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  DmRequest? dmThreadById(String id) {
+    return _dmRequests.where((r) => r.id == id).firstOrNull;
+  }
+
   void pinConversation(String threadId, bool isPinned) {
     final idx = _dmRequests.indexWhere((r) => r.id == threadId);
     if (idx != -1) {
@@ -3115,13 +3186,17 @@ class AppController extends ChangeNotifier {
     if (toUserId == _profile.id) return 'Cannot message yourself.';
     if (_blockedUserIds.contains(toUserId)) return 'This user is blocked.';
 
-    final existing = _dmRequests.any(
+    final existingIdx = _dmRequests.indexWhere(
       (r) =>
           ((r.fromUserId == _profile.id && r.toUserId == toUserId) ||
               (r.fromUserId == toUserId && r.toUserId == _profile.id)) &&
           r.status != DmRequestStatus.declined,
     );
-    if (existing) return 'A request or conversation already exists.';
+    if (existingIdx != -1) {
+      _pendingOpenDmThreadId = _dmRequests[existingIdx].id;
+      navigateToInbox();
+      return null;
+    }
 
     final resolvedToDisplayName =
         toDisplayName ??
@@ -3135,10 +3210,11 @@ class AppController extends ChangeNotifier {
             ?.activeDisplayName ??
         '@user';
 
+    final newThreadId = 'dm-${now.microsecondsSinceEpoch}';
     _dmRequests.insert(
       0,
       DmRequest(
-        id: 'dm-${now.microsecondsSinceEpoch}',
+        id: newThreadId,
         fromUserId: _profile.id,
         fromDisplayName: _profile.publicDisplayName,
         fromIsAnonymous: false,
@@ -3149,7 +3225,33 @@ class AppController extends ChangeNotifier {
         status: DmRequestStatus.pending,
       ),
     );
-    notifyListeners();
+    _pendingOpenDmThreadId = newThreadId;
+
+    if (isConnectedToBackend) {
+      apiClient?.createDmRequest(toUserId, introMessage: body).then((res) {
+        final idx = _dmRequests.indexWhere((r) => r.id == newThreadId);
+        if (idx != -1) {
+          _dmRequests[idx] = DmRequest(
+            id: res.id,
+            fromUserId: _profile.id,
+            fromDisplayName: _profile.publicDisplayName,
+            fromIsAnonymous: false,
+            toUserId: toUserId,
+            toDisplayName: resolvedToDisplayName,
+            introMessage: res.introMessage,
+            createdAt: res.createdAt,
+            status: DmRequestStatus.pending,
+            messages: _dmRequests[idx].messages,
+          );
+          if (_pendingOpenDmThreadId == newThreadId) {
+            _pendingOpenDmThreadId = res.id;
+          }
+          notifyListeners();
+        }
+      }).then((_) {}).catchError((_) {});
+    }
+
+    navigateToInbox();
     return null;
   }
 
@@ -3170,8 +3272,16 @@ class AppController extends ChangeNotifier {
       status: accept ? DmRequestStatus.accepted : DmRequestStatus.declined,
     );
     notifyListeners();
+
+    if (isConnectedToBackend) {
+      apiClient
+          ?.respondToDmRequest(requestId, accept: accept)
+          .then((_) {})
+          .catchError((_) {});
+    }
     return true;
   }
+
 
   bool sendDirectMessage(
     String requestId,
@@ -3226,6 +3336,34 @@ class AppController extends ChangeNotifier {
     ];
     _dmRequests[idx] = thread.copyWith(messages: updated);
     notifyListeners();
+
+    if (isConnectedToBackend) {
+      () async {
+        try {
+          String? mediaId;
+          final bytesToUpload = rawImageBytes ??
+              (attachment != null
+                  ? _mediaCache.get(attachment.mediaId)
+                  : null);
+          if (bytesToUpload != null) {
+            final uploadResp = await apiClient!.uploadMedia(
+              bytes: bytesToUpload,
+              filename: 'dm_image.jpg',
+              mimeType: 'image/jpeg',
+              channelId: requestId,
+              channelKind: 'dm',
+            );
+            mediaId = uploadResp.mediaId;
+          }
+          await apiClient!.postDmMessage(
+            requestId,
+            body: body.isNotEmpty ? body : '(Photo)',
+            attachmentId: mediaId,
+          );
+        } catch (_) {}
+      }();
+    }
+
     return true;
   }
 

@@ -231,5 +231,99 @@ void main() {
       // The current authenticated user should appear in results as (You)
       expect(nearbyList.any((p) => p.displayName.contains('(You)')), isTrue);
     });
+
+    test('End-to-end direct messaging, request acceptance, and image upload on live backend', () async {
+      if (!isBackendAvailable) {
+        markTestSkipped('Local backend not reachable on $backendBaseUrl');
+        return;
+      }
+
+      final ts = DateTime.now().millisecondsSinceEpoch % 100000000;
+      final aliceName = 'dm_a_$ts';
+      final bobName = 'dm_b_$ts';
+
+      final clientA = ApiClient(baseUrl: backendBaseUrl);
+      final clientB = ApiClient(baseUrl: backendBaseUrl);
+
+      // Register Alice
+      await clientA.register(
+        username: aliceName,
+        email: '$aliceName@sbuhacks.test',
+        password: 'Password123!',
+      );
+      final aliceProfile = await clientA.getMe();
+
+      // Register Bob
+      await clientB.register(
+        username: bobName,
+        email: '$bobName@sbuhacks.test',
+        password: 'Password123!',
+      );
+      final bobProfile = await clientB.getMe();
+
+      // 1. Alice sends DM request to Bob
+      final req = await clientA.createDmRequest(
+        bobProfile.id,
+        introMessage: 'Hello from live test!',
+      );
+      expect(req.status, 'pending');
+      expect(req.recipientId, bobProfile.id);
+      expect(req.isIncoming, isFalse);
+
+      final convId = req.id;
+
+      // 2. Idempotency on live backend
+      final req2 = await clientA.createDmRequest(
+        bobProfile.id,
+        introMessage: 'Repeat',
+      );
+      expect(req2.id, convId);
+
+      // 3. Bob checks inbox
+      final bobInbox = await clientB.getDmInbox();
+      expect(bobInbox.any((c) => c.id == convId), isTrue);
+      final bConv = bobInbox.firstWhere((c) => c.id == convId);
+      expect(bConv.status, 'pending');
+      expect(bConv.isIncoming, isTrue);
+
+      // 4. Bob accepts the DM request
+      final accepted = await clientB.respondToDmRequest(convId, accept: true);
+      expect(accepted.status, 'accepted');
+
+      // 5. Alice sends a direct message
+      final msgA = await clientA.postDmMessage(convId, body: 'Thanks for connecting!');
+      expect(msgA.sequence, 1);
+      expect(msgA.body, 'Thanks for connecting!');
+
+      // 6. Bob uploads an image and sends with attachment
+      final minimalJpeg = <int>[
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+        0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xC0, 0x00, 0x0B,
+        0x08, 0x00, 0x0A, 0x00, 0x0A, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xDA, 0x00,
+        0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0xBF, 0x00, 0xFF, 0xD9,
+      ];
+      final mediaUpload = await clientB.uploadMedia(
+        bytes: minimalJpeg,
+        filename: 'live_test.jpg',
+        mimeType: 'image/jpeg',
+        channelId: convId,
+        channelKind: 'dm',
+      );
+      expect(mediaUpload.mediaId, isNotEmpty);
+
+      final msgB = await clientB.postDmMessage(
+        convId,
+        body: 'Here is my photo',
+        attachmentId: mediaUpload.mediaId,
+      );
+      expect(msgB.sequence, 2);
+      expect(msgB.attachmentId, mediaUpload.mediaId);
+
+      // 7. Alice fetches messages and verifies both messages
+      final messages = await clientA.getDmMessages(convId);
+      expect(messages.length, 2);
+      expect(messages[0].body, 'Thanks for connecting!');
+      expect(messages[1].attachmentId, mediaUpload.mediaId);
+    });
   });
 }

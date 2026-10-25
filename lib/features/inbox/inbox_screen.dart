@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../core/media/native_image_picker_helper.dart';
 import '../../core/models/models.dart';
 import '../../core/state/app_controller.dart';
 import '../../core/theme/app_theme.dart';
@@ -19,6 +20,31 @@ class InboxScreen extends StatefulWidget {
 class _InboxScreenState extends State<InboxScreen> {
   _InboxFilter _filter = _InboxFilter.active;
 
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_checkPendingOpenThread);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _checkPendingOpenThread());
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_checkPendingOpenThread);
+    super.dispose();
+  }
+
+  void _checkPendingOpenThread() {
+    final threadId = widget.controller.consumePendingOpenDmThreadId();
+    if (threadId != null && mounted) {
+      final thread = widget.controller.dmThreadById(threadId);
+      if (thread != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _openThreadSheet(context, thread);
+        });
+      }
+    }
+  }
+
   void _openThreadSheet(BuildContext context, DmRequest thread) {
     final msgCtrl = TextEditingController();
     showModalBottomSheet<void>(
@@ -30,23 +56,22 @@ class _InboxScreenState extends State<InboxScreen> {
       ),
       builder: (ctx) {
         return FractionallySizedBox(
-          heightFactor: 0.8,
+          heightFactor: 0.85,
           child: ListenableBuilder(
             listenable: widget.controller,
             builder: (context, _) {
-              final current = widget.controller.acceptedDmThreads
-                  .where((t) => t.id == thread.id)
-                  .firstOrNull;
+              final current = widget.controller.dmThreadById(thread.id);
               if (current == null) {
                 return const Center(child: Text('Conversation unavailable.'));
               }
+              final isMeSender =
+                  current.fromUserId == widget.controller.profile.id;
               final peerName =
-                  current.fromUserId == widget.controller.profile.id
-                  ? current.toDisplayName
-                  : current.fromDisplayName;
-              final peerId = current.fromUserId == widget.controller.profile.id
-                  ? current.toUserId
-                  : current.fromUserId;
+                  isMeSender ? current.toDisplayName : current.fromDisplayName;
+              final peerId =
+                  isMeSender ? current.toUserId : current.fromUserId;
+              final isPending = current.status == DmRequestStatus.pending;
+              final isIncoming = !isMeSender && isPending;
 
               return Padding(
                 padding: EdgeInsets.only(
@@ -61,12 +86,56 @@ class _InboxScreenState extends State<InboxScreen> {
                     Row(
                       children: <Widget>[
                         Expanded(
-                          child: Text(
-                            peerName,
-                            style: const TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.w700,
-                            ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                peerName,
+                                style: const TextStyle(
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              if (isPending)
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 2),
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 2,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: Colors.amber.withAlpha(40),
+                                      borderRadius: BorderRadius.circular(12),
+                                      border: Border.all(
+                                        color: Colors.amber.shade700,
+                                        width: 1,
+                                      ),
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(
+                                          Icons.hourglass_empty,
+                                          size: 12,
+                                          color: Colors.amber.shade800,
+                                        ),
+                                        const SizedBox(width: 4),
+                                        Text(
+                                          isIncoming
+                                              ? 'Incoming Request (Pending)'
+                                              : 'Outgoing Request (Pending)',
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.bold,
+                                            color: Colors.amber.shade800,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                            ],
                           ),
                         ),
                         TextButton.icon(
@@ -87,24 +156,77 @@ class _InboxScreenState extends State<InboxScreen> {
                       child: ListView(
                         children: <Widget>[
                           Container(
-                            padding: const EdgeInsets.all(10),
-                            margin: const EdgeInsets.only(bottom: 10),
+                            padding: const EdgeInsets.all(12),
+                            margin: const EdgeInsets.only(bottom: 12),
                             decoration: BoxDecoration(
                               color: Theme.of(context)
                                   .colorScheme
                                   .surfaceContainer,
                               borderRadius: BorderRadius.circular(12),
                             ),
-                            child: Text(
-                              'Request note: "${current.introMessage}"',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: Theme.of(context)
-                                    .colorScheme
-                                    .onSurfaceVariant,
-                              ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Request note: "${current.introMessage}"',
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w500,
+                                    color: Theme.of(context)
+                                        .colorScheme
+                                        .onSurface,
+                                  ),
+                                ),
+                                if (isPending) ...[
+                                  const SizedBox(height: 6),
+                                  Text(
+                                    isIncoming
+                                        ? 'Review and accept this request to unlock direct messaging and photos.'
+                                        : 'Awaiting response from $peerName. Messaging will be unlocked once accepted.',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .onSurfaceVariant,
+                                    ),
+                                  ),
+                                ],
+                              ],
                             ),
                           ),
+                          if (isIncoming) ...[
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: FilledButton.icon(
+                                    onPressed: () {
+                                      widget.controller.respondToDmRequest(
+                                        current.id,
+                                        accept: true,
+                                      );
+                                    },
+                                    icon: const Icon(Icons.check, size: 16),
+                                    label: const Text('Accept Request'),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: OutlinedButton.icon(
+                                    onPressed: () {
+                                      widget.controller.respondToDmRequest(
+                                        current.id,
+                                        accept: false,
+                                      );
+                                      Navigator.of(ctx).pop();
+                                    },
+                                    icon: const Icon(Icons.close, size: 16),
+                                    label: const Text('Decline'),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 12),
+                          ],
                           ...current.messages.map((m) {
                             final isMe =
                                 m.senderId == widget.controller.profile.id;
@@ -157,54 +279,124 @@ class _InboxScreenState extends State<InboxScreen> {
                         ],
                       ),
                     ),
-                    Row(
-                      children: <Widget>[
-                        IconButton(
-                          tooltip: 'Share EXIF-stripped photo',
-                          onPressed: () {
-                            widget.controller.sendDirectMessage(
-                              current.id,
-                              msgCtrl.text,
-                              rawImageBytes: buildSampleCameraJpegBytes(),
-                            );
-                            msgCtrl.clear();
-                          },
-                          icon: const Icon(
-                            Icons.add_photo_alternate_outlined,
-                            size: 20,
-                          ),
-                        ),
-                        Expanded(
-                          child: TextField(
-                            controller: msgCtrl,
-                            decoration: const InputDecoration(
-                              hintText: 'Write a direct message...',
-                              isDense: true,
+                    if (!isPending) ...[
+                      // Staged Image Preview Bar
+                      Builder(
+                        builder: (_) {
+                          final staged = widget.controller
+                              .pendingUploadsForChannel(current.id);
+                          if (staged.isEmpty) return const SizedBox.shrink();
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: StagedImagePreviewBar(
+                              pendingUploads: staged,
+                              onCancel: (id) =>
+                                  widget.controller.cancelStagedUpload(id),
                             ),
-                            onSubmitted: (_) {
+                          );
+                        },
+                      ),
+                      Row(
+                        children: <Widget>[
+                          IconButton(
+                            tooltip: 'Share photo',
+                            onPressed: () async {
+                              final result = await NativeImagePickerHelper()
+                                  .promptAndPickSanitizedImage(
+                                    ctx,
+                                    maxBytes: widget.controller.maxImageBytes,
+                                  );
+                              if (result == null) return;
+                              if (result.errorMessage != null && ctx.mounted) {
+                                ScaffoldMessenger.of(ctx).showSnackBar(
+                                  SnackBar(
+                                    content: Text(result.errorMessage!),
+                                    backgroundColor: Colors.redAccent,
+                                  ),
+                                );
+                                return;
+                              }
+                              if (result.isValid &&
+                                  result.sanitizedBytes != null) {
+                                widget.controller.stageImageUpload(
+                                  channelId: current.id,
+                                  rawBytes: result.sanitizedBytes!,
+                                );
+                              }
+                            },
+                            icon: const Icon(
+                              Icons.add_photo_alternate_outlined,
+                              size: 20,
+                            ),
+                          ),
+                          Expanded(
+                            child: TextField(
+                              controller: msgCtrl,
+                              decoration: const InputDecoration(
+                                hintText: 'Write a direct message...',
+                                isDense: true,
+                              ),
+                              onSubmitted: (_) {
+                                final staged = widget.controller
+                                    .pendingUploadsForChannel(current.id)
+                                    .firstOrNull;
+                                if (widget.controller.sendDirectMessage(
+                                  current.id,
+                                  msgCtrl.text,
+                                  stagedUploadId: staged?.uploadId,
+                                )) {
+                                  msgCtrl.clear();
+                                }
+                              },
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          IconButton.filled(
+                            onPressed: () {
+                              final staged = widget.controller
+                                  .pendingUploadsForChannel(current.id)
+                                  .firstOrNull;
                               if (widget.controller.sendDirectMessage(
                                 current.id,
                                 msgCtrl.text,
+                                stagedUploadId: staged?.uploadId,
                               )) {
                                 msgCtrl.clear();
                               }
                             },
+                            icon: const Icon(Icons.send_rounded, size: 18),
                           ),
+                        ],
+                      ),
+                    ] else ...[
+                      Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context)
+                              .colorScheme
+                              .surfaceContainerHighest
+                              .withAlpha(120),
+                          borderRadius: BorderRadius.circular(12),
                         ),
-                        const SizedBox(width: 8),
-                        IconButton.filled(
-                          onPressed: () {
-                            if (widget.controller.sendDirectMessage(
-                              current.id,
-                              msgCtrl.text,
-                            )) {
-                              msgCtrl.clear();
-                            }
-                          },
-                          icon: const Icon(Icons.send_rounded, size: 18),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.lock_outline, size: 16),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                isIncoming
+                                    ? 'Accept request to enable chat composer'
+                                    : 'Chat locked until recipient accepts request',
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ],
                 ),
               );
@@ -339,120 +531,171 @@ class _InboxScreenState extends State<InboxScreen> {
                     return Padding(
                       padding: const EdgeInsets.only(bottom: 10),
                       child: Card(
-                        child: Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: <Widget>[
-                              Row(
-                                children: <Widget>[
-                                  const Icon(
-                                    Icons.mark_chat_unread_outlined,
-                                    size: 16,
-                                    color: AppTheme.pulseMint,
-                                  ),
-                                  const SizedBox(width: 6),
-                                  Expanded(
-                                    child: Text(
-                                      incoming
-                                          ? 'From ${req.fromDisplayName}'
-                                          : 'Sent to ${req.toDisplayName}',
-                                      style: const TextStyle(
-                                        fontWeight: FontWeight.w700,
-                                        fontSize: 15,
-                                      ),
-                                    ),
-                                  ),
-                                  if (incoming)
-                                    IconButton(
-                                      tooltip: 'Block sender',
-                                      onPressed: () =>
-                                          widget.controller.blockUser(
-                                            req.fromUserId,
-                                            label: req.fromDisplayName,
-                                          ),
-                                      icon: const Icon(Icons.block, size: 18),
-                                    ),
-                                ],
-                              ),
-                              if (incoming &&
-                                  req.fromRealUsername != null) ...<Widget>[
-                                const SizedBox(height: 6),
-                                Container(
-                                  padding: const EdgeInsets.all(8),
-                                  decoration: BoxDecoration(
-                                    color: Theme.of(context)
-                                        .colorScheme
-                                        .surfaceContainer,
-                                    borderRadius: BorderRadius.circular(8),
-                                  ),
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: <Widget>[
-                                      Text(
-                                        'Sender real profile: @${req.fromRealUsername}',
-                                        style: const TextStyle(
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w600,
-                                          color: AppTheme.pulseMint,
-                                        ),
-                                      ),
-                                      if (req.fromRealBio != null &&
-                                          req.fromRealBio!.isNotEmpty)
-                                        Text(
-                                          req.fromRealBio!,
-                                          style: TextStyle(
-                                            fontSize: 11,
-                                            color: Theme.of(context)
-                                                .colorScheme
-                                                .onSurfaceVariant,
-                                          ),
-                                        ),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                              const SizedBox(height: 6),
-                              Text(
-                                '"${req.introMessage}"',
-                                style: TextStyle(
-                                  color: Theme.of(context)
-                                      .colorScheme
-                                      .onSurface,
-                                ),
-                              ),
-                              if (incoming) ...<Widget>[
-                                const SizedBox(height: 12),
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: () => _openThreadSheet(context, req),
+                          child: Padding(
+                            padding: const EdgeInsets.all(16),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: <Widget>[
                                 Row(
                                   children: <Widget>[
+                                    const Icon(
+                                      Icons.mark_chat_unread_outlined,
+                                      size: 16,
+                                      color: AppTheme.pulseMint,
+                                    ),
+                                    const SizedBox(width: 6),
                                     Expanded(
-                                      child: FilledButton.icon(
-                                        onPressed: () => widget.controller
-                                            .respondToDmRequest(
-                                              req.id,
-                                              accept: true,
-                                            ),
-                                        icon: const Icon(Icons.check, size: 16),
-                                        label: const Text('Accept'),
+                                      child: Text(
+                                        incoming
+                                            ? 'From ${req.fromDisplayName}'
+                                            : 'Sent to ${req.toDisplayName}',
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.w700,
+                                          fontSize: 15,
+                                        ),
                                       ),
                                     ),
-                                    const SizedBox(width: 10),
-                                    Expanded(
-                                      child: OutlinedButton.icon(
-                                        onPressed: () => widget.controller
-                                            .respondToDmRequest(
-                                              req.id,
-                                              accept: false,
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                        vertical: 3,
+                                      ),
+                                      margin: const EdgeInsets.only(left: 6),
+                                      decoration: BoxDecoration(
+                                        color: Colors.amber.withAlpha(40),
+                                        borderRadius: BorderRadius.circular(12),
+                                        border: Border.all(
+                                          color: Colors.amber.shade700,
+                                          width: 1,
+                                        ),
+                                      ),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(
+                                            Icons.hourglass_empty,
+                                            size: 12,
+                                            color: Colors.amber.shade800,
+                                          ),
+                                          const SizedBox(width: 4),
+                                          Text(
+                                            'Pending',
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.bold,
+                                              color: Colors.amber.shade800,
                                             ),
-                                        icon: const Icon(Icons.close, size: 16),
-                                        label: const Text('Decline'),
+                                          ),
+                                        ],
                                       ),
                                     ),
+                                    if (incoming)
+                                      IconButton(
+                                        tooltip: 'Block sender',
+                                        onPressed: () =>
+                                            widget.controller.blockUser(
+                                              req.fromUserId,
+                                              label: req.fromDisplayName,
+                                            ),
+                                        icon: const Icon(Icons.block, size: 18),
+                                      ),
                                   ],
                                 ),
+                                if (incoming &&
+                                    req.fromRealUsername != null) ...<Widget>[
+                                  const SizedBox(height: 6),
+                                  Container(
+                                    padding: const EdgeInsets.all(8),
+                                    decoration: BoxDecoration(
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .surfaceContainer,
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: <Widget>[
+                                        Text(
+                                          'Sender real profile: @${req.fromRealUsername}',
+                                          style: const TextStyle(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w600,
+                                            color: AppTheme.pulseMint,
+                                          ),
+                                        ),
+                                        if (req.fromRealBio != null &&
+                                            req.fromRealBio!.isNotEmpty)
+                                          Text(
+                                            req.fromRealBio!,
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              color: Theme.of(context)
+                                                  .colorScheme
+                                                  .onSurfaceVariant,
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                                const SizedBox(height: 6),
+                                Text(
+                                  '"${req.introMessage}"',
+                                  style: TextStyle(
+                                    color: Theme.of(context)
+                                        .colorScheme
+                                        .onSurface,
+                                  ),
+                                ),
+                                if (!incoming) ...<Widget>[
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    'Awaiting response • Tap to view',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontStyle: FontStyle.italic,
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .onSurfaceVariant,
+                                    ),
+                                  ),
+                                ],
+                                if (incoming) ...<Widget>[
+                                  const SizedBox(height: 12),
+                                  Row(
+                                    children: <Widget>[
+                                      Expanded(
+                                        child: FilledButton.icon(
+                                          onPressed: () => widget.controller
+                                              .respondToDmRequest(
+                                                req.id,
+                                                accept: true,
+                                              ),
+                                          icon: const Icon(Icons.check, size: 16),
+                                          label: const Text('Accept'),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: OutlinedButton.icon(
+                                          onPressed: () => widget.controller
+                                              .respondToDmRequest(
+                                                req.id,
+                                                accept: false,
+                                              ),
+                                          icon: const Icon(Icons.close, size: 16),
+                                          label: const Text('Decline'),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ],
                               ],
-                            ],
+                            ),
                           ),
                         ),
                       ),

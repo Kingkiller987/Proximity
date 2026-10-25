@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 
 import 'api_models.dart';
 
@@ -538,11 +539,16 @@ class ApiClient {
     request.headers.addAll(_buildHeaders(isJson: false));
     request.fields['channel_id'] = channelId;
     request.fields['channel_kind'] = channelKind;
+    final parts = mimeType.split('/');
+    final primaryType = parts.isNotEmpty ? parts[0] : 'image';
+    final subType = parts.length > 1 ? parts[1] : 'jpeg';
+
     request.files.add(
       http.MultipartFile.fromBytes(
         'file',
         bytes,
         filename: filename,
+        contentType: MediaType(primaryType, subType),
       ),
     );
 
@@ -574,4 +580,89 @@ class ApiClient {
     _processResponse(res);
     return Uint8List(0);
   }
+
+  // --- DIRECT MESSAGING ---
+
+  Future<DmConversationResponse> createDmRequest(
+    String recipientId, {
+    String introMessage = 'Hello!',
+  }) async {
+    final res = await _sendWithAuthRetry(
+      () => _client.post(
+        _uri('/dm/requests'),
+        headers: _buildHeaders(),
+        body: jsonEncode({
+          'recipient_id': recipientId,
+          'intro_message': introMessage,
+        }),
+      ),
+    );
+    final data = _processResponse(res) as Map<String, dynamic>;
+    return DmConversationResponse.fromJson(data);
+  }
+
+  Future<List<DmConversationResponse>> getDmInbox({int limit = 50, int offset = 0}) async {
+    final res = await _sendWithAuthRetry(
+      () => _client.get(
+        _uri('/dm/inbox', {'limit': '$limit', 'offset': '$offset'}),
+        headers: _buildHeaders(),
+      ),
+    );
+    final data = _processResponse(res) as List<dynamic>;
+    return data.map((item) => DmConversationResponse.fromJson(item as Map<String, dynamic>)).toList();
+  }
+
+  Future<DmConversationResponse> getDmConversation(String conversationId) async {
+    final res = await _sendWithAuthRetry(
+      () => _client.get(_uri('/dm/conversations/$conversationId'), headers: _buildHeaders()),
+    );
+    final data = _processResponse(res) as Map<String, dynamic>;
+    return DmConversationResponse.fromJson(data);
+  }
+
+  Future<DmConversationResponse> respondToDmRequest(
+    String conversationId, {
+    required bool accept,
+  }) async {
+    final res = await _sendWithAuthRetry(
+      () => _client.post(
+        _uri('/dm/conversations/$conversationId/respond'),
+        headers: _buildHeaders(),
+        body: jsonEncode({'accept': accept}),
+      ),
+    );
+    final data = _processResponse(res) as Map<String, dynamic>;
+    return DmConversationResponse.fromJson(data);
+  }
+
+  Future<List<ChatMessageResponse>> getDmMessages(String conversationId, {int limit = 50}) async {
+    final res = await _sendWithAuthRetry(
+      () => _client.get(
+        _uri('/dm/conversations/$conversationId/messages', {'limit': '$limit'}),
+        headers: _buildHeaders(),
+      ),
+    );
+    final data = _processResponse(res) as List<dynamic>;
+    return data.map((item) => ChatMessageResponse.fromJson(item as Map<String, dynamic>)).toList();
+  }
+
+  Future<ChatMessageResponse> postDmMessage(
+    String conversationId, {
+    required String body,
+    String? attachmentId,
+  }) async {
+    final payload = <String, dynamic>{'body': body};
+    if (attachmentId != null) payload['attachment_id'] = attachmentId;
+
+    final res = await _sendWithAuthRetry(
+      () => _client.post(
+        _uri('/dm/conversations/$conversationId/messages'),
+        headers: _buildHeaders(),
+        body: jsonEncode(payload),
+      ),
+    );
+    final data = _processResponse(res) as Map<String, dynamic>;
+    return ChatMessageResponse.fromJson(data);
+  }
 }
+

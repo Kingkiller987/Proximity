@@ -532,3 +532,61 @@ class MediaDownloadTokenResponse {
     'expires_at': expiresAt.toUtc().toIso8601String(),
   };
 }
+
+@immutable
+class DmConversationResponse {
+  const DmConversationResponse({
+    required this.id,
+    required this.initiatorId,
+    required this.recipientId,
+    required this.status,
+    required this.introMessage,
+    required this.otherUser,
+    required this.isIncoming,
+    this.lastMessage,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  factory DmConversationResponse.fromJson(Map<String, dynamic> json) {
+    return DmConversationResponse(
+      id: json['id'] as String,
+      initiatorId: json['initiator_id'] as String,
+      recipientId: json['recipient_id'] as String,
+      status: json['status'] as String,
+      introMessage: (json['intro_message'] as String?) ?? '',
+      otherUser: PublicIdentityProjection.fromJson(json['other_user'] as Map<String, dynamic>),
+      isIncoming: json['is_incoming'] as bool,
+      lastMessage: json['last_message'] != null
+          ? ChatMessageResponse.fromJson(json['last_message'] as Map<String, dynamic>)
+          : null,
+      createdAt: DateTime.parse(json['created_at'] as String),
+      updatedAt: DateTime.parse(json['updated_at'] as String),
+    );
+  }
+
+  final String id;
+  final String initiatorId;
+  final String recipientId;
+  final String status;
+  final String introMessage;
+  final PublicIdentityProjection otherUser;
+  final bool isIncoming;
+  final ChatMessageResponse? lastMessage;
+  final DateTime createdAt;
+  final DateTime updatedAt;
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'initiator_id': initiatorId,
+    'recipient_id': recipientId,
+    'status': status,
+    'intro_message': introMessage,
+    'other_user': otherUser.toJson(),
+    'is_incoming': isIncoming,
+    if (lastMessage != null) 'last_message': lastMessage!.toJson(),
+    'created_at': createdAt.toUtc().toIso8601String(),
+    'updated_at': updatedAt.toUtc().toIso8601String(),
+  };
+}
+

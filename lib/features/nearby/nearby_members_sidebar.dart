@@ -107,6 +107,7 @@ class NearbyMembersSidebar extends StatelessWidget {
                               toDisplayName: projection.displayName,
                               introMessage: 'Hello!',
                             );
+                            Navigator.of(context).maybePop();
                           },
                           onBlock: () => c.blockUser(
                             p.userId,
