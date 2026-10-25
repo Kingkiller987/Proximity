@@ -7,6 +7,8 @@ import '../location/location_service.dart';
 import '../media/ephemeral_media_cache.dart';
 import '../media/media_sanitizer.dart';
 import '../models/models.dart';
+import '../network/api_client.dart';
+import '../network/api_models.dart' hide PublicIdentityProjection;
 
 @immutable
 class _StoredNearbyParticipant {
@@ -360,6 +362,7 @@ class AppController extends ChangeNotifier {
     this.locationService,
     this.maxImageBytes = 5 * 1024 * 1024,
     AuthSessionStore? sessionStore,
+    this.apiClient,
   }) : _clock = clock ?? DateTime.now,
        _handleStorage = handleStorage,
        sessionStore = sessionStore ?? LocalDemoSessionStore() {
@@ -384,6 +387,9 @@ class AppController extends ChangeNotifier {
   final LocationService? locationService;
   final int maxImageBytes;
   final AuthSessionStore sessionStore;
+  final ApiClient? apiClient;
+
+  bool get isConnectedToBackend => apiClient != null && apiClient!.isAuthenticated;
 
   static const String generalChannelId = 'lm-staller';
 
@@ -1700,6 +1706,37 @@ class AppController extends ChangeNotifier {
   }
 
   Future<bool> restoreSavedSession() async {
+    final client = apiClient;
+    if (client != null) {
+      final savedRefreshToken = await sessionStore.getRefreshToken();
+      final savedAccessToken = await sessionStore.getAccessToken();
+      if (savedRefreshToken != null || savedAccessToken != null) {
+        client.setTokens(accessToken: savedAccessToken, refreshToken: savedRefreshToken);
+        try {
+          final me = await client.getMe();
+          _profile = UserProfile(
+            id: me.id,
+            username: me.username,
+            anonymousHandle: me.anonymousHandle,
+            identityMode: me.identityMode == 'anonymous' ? IdentityMode.anonymous : IdentityMode.real,
+            visibleInNearby: me.visibleInNearby,
+            ghostBrowseNearby: me.ghostBrowseNearby,
+            isGhostMode: me.isGhostMode,
+            nearbyRadiusMeters: me.nearbyRadiusMeters,
+            messageRetentionHours: me.messageRetentionHours,
+            bio: me.bio,
+          );
+          _isAuthenticated = true;
+          await syncFromBackend();
+          notifyListeners();
+          return true;
+        } catch (_) {
+          client.clearTokens();
+          await sessionStore.clearTokens();
+        }
+      }
+    }
+
     final username = await sessionStore.getSavedSessionUsername();
     if (username != null && username.isNotEmpty) {
       final clean = username.trim().toLowerCase();
@@ -1713,6 +1750,159 @@ class AppController extends ChangeNotifier {
     _isAuthenticated = false;
     notifyListeners();
     return false;
+  }
+
+  /// Asynchronous login supporting real FastAPI Cloud backend with demo fallback.
+  Future<String?> loginAsync({
+    required String username,
+    required String password,
+  }) async {
+    final client = apiClient;
+    if (client != null) {
+      try {
+        final tokens = await client.login(username: username, password: password);
+        await sessionStore.saveTokens(
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken,
+        );
+        final me = await client.getMe();
+        _profile = UserProfile(
+          id: me.id,
+          username: me.username,
+          anonymousHandle: me.anonymousHandle,
+          identityMode: me.identityMode == 'anonymous' ? IdentityMode.anonymous : IdentityMode.real,
+          visibleInNearby: me.visibleInNearby,
+          ghostBrowseNearby: me.ghostBrowseNearby,
+          isGhostMode: me.isGhostMode,
+          nearbyRadiusMeters: me.nearbyRadiusMeters,
+          messageRetentionHours: me.messageRetentionHours,
+          bio: me.bio,
+        );
+        _isAuthenticated = true;
+        await sessionStore.saveSessionUsername(me.username);
+        await syncFromBackend();
+        notifyListeners();
+        return null;
+      } on ApiException catch (e) {
+        return e.message;
+      } catch (e) {
+        return 'Connection error: unable to reach Proximity API';
+      }
+    }
+    return login(username);
+  }
+
+  /// Asynchronous registration supporting real FastAPI Cloud backend with demo fallback.
+  Future<String?> registerAsync({
+    required String username,
+    required String email,
+    required String password,
+  }) async {
+    final client = apiClient;
+    if (client != null) {
+      try {
+        final tokens = await client.register(
+          username: username,
+          email: email,
+          password: password,
+        );
+        await sessionStore.saveTokens(
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken,
+        );
+        final me = await client.getMe();
+        _profile = UserProfile(
+          id: me.id,
+          username: me.username,
+          anonymousHandle: me.anonymousHandle,
+          identityMode: me.identityMode == 'anonymous' ? IdentityMode.anonymous : IdentityMode.real,
+          visibleInNearby: me.visibleInNearby,
+          ghostBrowseNearby: me.ghostBrowseNearby,
+          isGhostMode: me.isGhostMode,
+          nearbyRadiusMeters: me.nearbyRadiusMeters,
+          messageRetentionHours: me.messageRetentionHours,
+          bio: me.bio,
+        );
+        _isAuthenticated = true;
+        await sessionStore.saveSessionUsername(me.username);
+        if (shouldShowOnboardingFor(me.id)) {
+          _isOnboardingActive = true;
+        }
+        await syncFromBackend();
+        notifyListeners();
+        return null;
+      } on ApiException catch (e) {
+        return e.message;
+      } catch (e) {
+        return 'Connection error: unable to reach Proximity API';
+      }
+    }
+    return register(username: username, email: email, password: password);
+  }
+
+  /// Synchronizes live landmarks, nearby participants, and events from the backend.
+  Future<void> syncFromBackend() async {
+    final client = apiClient;
+    if (client == null || !client.isAuthenticated) return;
+    try {
+      final fix = latestLocationFix;
+      final lmList = await client.getLandmarks(
+        latitude: fix?.latitude ?? _currentLocation.latitude,
+        longitude: fix?.longitude ?? _currentLocation.longitude,
+      );
+      if (lmList.isNotEmpty) {
+        _curatedLandmarks.clear();
+        for (final l in lmList) {
+          LandmarkCategory cat = LandmarkCategory.pointOfInterest;
+          for (final c in LandmarkCategory.values) {
+            if (c.name.toLowerCase() == l.category.toLowerCase()) {
+              cat = c;
+              break;
+            }
+          }
+          _curatedLandmarks.add(
+            _StoredLandmark(
+              id: l.id,
+              name: l.name,
+              areaName: l.areaName,
+              center: GeoPoint(latitude: l.latitude, longitude: l.longitude, areaName: l.areaName),
+              radiusMeters: l.radiusMeters,
+              category: cat,
+            ),
+          );
+        }
+      }
+
+      if (fix != null) {
+        final nearby = await client.discoverNearby(
+          LocationFixRequest(
+            latitude: fix.latitude,
+            longitude: fix.longitude,
+            accuracyMeters: fix.accuracyMeters,
+            recordedAt: fix.recordedAt,
+            areaName: fix.areaName,
+          ),
+        );
+        if (nearby.isNotEmpty) {
+          _otherParticipants.clear();
+          for (final p in nearby) {
+            if (p.userId != _profile.id && !p.displayName.contains('(You)')) {
+              _otherParticipants.add(
+                _StoredNearbyParticipant(
+                  userId: p.userId,
+                  displayName: p.displayName,
+                  isAnonymous: p.isAnonymous,
+                  location: _currentLocation,
+                  visibleInNearby: p.visibleInNearby,
+                ),
+              );
+            }
+          }
+        }
+      }
+    } catch (_) {
+      // Gracefully handle background sync errors
+    }
   }
 
   /// Demonstration login. Checks mock registry case-insensitively.
@@ -1786,9 +1976,10 @@ class AppController extends ChangeNotifier {
     return null;
   }
 
-  /// Logs out of the current demonstration session.
+  /// Logs out of the current session.
   void logout() {
     _isAuthenticated = false;
+    apiClient?.logout();
     sessionStore.clearSession();
     notifyListeners();
   }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'core/config/app_config.dart';
 import 'core/location/location_service.dart';
+import 'core/network/api_client.dart';
 import 'core/state/app_controller.dart';
 import 'core/theme/app_theme.dart';
 import 'features/auth/auth_screen.dart';
@@ -16,10 +17,15 @@ final Map<String, String> _appHandleStorage = <String, String>{};
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   final config = AppConfig.fromEnvironment();
+  ApiClient? apiClient;
+  if (config.hasApiConfigured) {
+    apiClient = ApiClient(baseUrl: config.apiBaseUrl);
+  }
   final controller = AppController(
     handleStorage: _appHandleStorage,
     locationService: const GeolocatorLocationService(),
     maxImageBytes: config.maxImageBytes,
+    apiClient: apiClient,
   );
   runApp(ProximityApp(config: config, controller: controller));
 }

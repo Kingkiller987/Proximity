@@ -7,6 +7,7 @@ class AppConfig {
     required this.supabaseUrl,
     required this.supabaseAnonKey,
     required this.allowSimulatedLocation,
+    this.apiBaseUrl = '',
     this.mapTileUrlTemplate = defaultDevTileUrlTemplate,
     this.mapUserAgentPackageName = 'com.proximity.app',
     this.maxImageBytes = 5 * 1024 * 1024,
@@ -41,12 +42,14 @@ class AppConfig {
       'MAX_IMAGE_BYTES',
       defaultValue: 5 * 1024 * 1024,
     );
+    const apiBase = String.fromEnvironment('API_BASE_URL', defaultValue: '');
 
     return const AppConfig(
       environment: env,
       supabaseUrl: supabaseUrl,
       supabaseAnonKey: supabaseAnonKey,
       allowSimulatedLocation: allowSim,
+      apiBaseUrl: apiBase,
       mapTileUrlTemplate: tileUrl,
       mapUserAgentPackageName: userAgent,
       maxImageBytes: maxImgBytes,
@@ -57,11 +60,14 @@ class AppConfig {
   final String supabaseUrl;
   final String supabaseAnonKey;
   final bool allowSimulatedLocation;
+  final String apiBaseUrl;
   final String mapTileUrlTemplate;
   final String mapUserAgentPackageName;
   final int maxImageBytes;
   final int maxLocationAgeSeconds;
   final double maxGpsAccuracyMeters;
+
+  bool get hasApiConfigured => apiBaseUrl.trim().isNotEmpty;
 
   bool get hasSupabaseConfigured =>
       supabaseUrl.isNotEmpty && supabaseAnonKey.isNotEmpty;

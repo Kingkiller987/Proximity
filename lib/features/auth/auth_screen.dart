@@ -101,7 +101,7 @@ class _AuthScreenState extends State<AuthScreen> {
     return isValid;
   }
 
-  void _submit() {
+  Future<void> _submit() async {
     if (_isSubmitting) return;
 
     final isValid = _validateInputs();
@@ -119,14 +119,19 @@ class _AuthScreenState extends State<AuthScreen> {
 
     String? error;
     if (_isRegistering) {
-      error = widget.controller.register(
+      error = await widget.controller.registerAsync(
         username: username,
         email: email,
         password: password,
       );
     } else {
-      error = widget.controller.login(username);
+      error = await widget.controller.loginAsync(
+        username: username,
+        password: password,
+      );
     }
+
+    if (!mounted) return;
 
     if (error != null) {
       setState(() {
